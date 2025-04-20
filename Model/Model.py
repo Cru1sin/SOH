@@ -4,6 +4,7 @@ import numpy as np
 from torch.autograd import grad
 from utils.util import AverageMeter,get_logger,eval_metrix
 import os
+import wandb
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 # device = 'cpu'
 
@@ -15,7 +16,7 @@ class Sin(nn.Module):
         return torch.sin(x)
 
 class MLP(nn.Module):
-    def __init__(self,input_dim=17,output_dim=1,layers_num=4,hidden_dim=50,droupout=0.2):
+    def __init__(self,input_dim=6,output_dim=1,layers_num=4,hidden_dim=50,droupout=0.2):
         super(MLP, self).__init__()
 
         assert layers_num >= 2, "layers must be greater than 2"
@@ -64,7 +65,7 @@ class Predictor(nn.Module):
 class Solution_u(nn.Module):
     def __init__(self):
         super(Solution_u, self).__init__()
-        self.encoder = MLP(input_dim=17,output_dim=32,layers_num=3,hidden_dim=60,droupout=0.2)
+        self.encoder = MLP(input_dim=20,output_dim=32,layers_num=3,hidden_dim=60,droupout=0.2)
         self.predictor = Predictor(input_dim=32)
         self._init_()
 
@@ -72,7 +73,10 @@ class Solution_u(nn.Module):
         return self.encoder(x)
 
     def forward(self,x):
+        batch_size, small_batch, input_dim = x.shape
+        x = x.reshape(-1, input_dim)  # (32 * 126, 6)
         x = self.encoder(x)
+        x = x.reshape(batch_size, small_batch, -1)  # (32, 126, 32)
         x = self.predictor(x)
         return x
 
@@ -84,6 +88,77 @@ class Solution_u(nn.Module):
             elif isinstance(layer,nn.Conv1d):
                 nn.init.xavier_normal_(layer.weight)
                 nn.init.constant_(layer.bias,0)
+
+class ResBlock(nn.Module):
+    def __init__(self, input_channel, output_channel, stride):
+        super(ResBlock, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv1d(input_channel, output_channel, kernel_size=3, stride=stride, padding=1),
+            nn.BatchNorm1d(output_channel),
+            nn.ReLU(),
+            nn.Conv1d(output_channel, output_channel, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm1d(output_channel)
+        )
+
+        self.skip_connection = nn.Sequential()
+        if output_channel != input_channel:
+            self.skip_connection = nn.Sequential(
+                nn.Conv1d(input_channel, output_channel, kernel_size=1, stride=stride),
+                nn.BatchNorm1d(output_channel)
+            )
+
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        out = self.conv(x)
+        out = self.skip_connection(x) + out
+        out = self.relu(out)
+        return out
+    
+
+class CNN(nn.Module):
+    '''
+    input shape: (batch_size, 126, 40) 
+    output shape: (batch_size, 32) 
+    '''
+    def __init__(self):
+        super(CNN,self).__init__()
+        # 初始卷积层
+        self.conv1 = nn.Sequential(
+            nn.Conv1d(40, 24, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm1d(24),
+            nn.ReLU()
+        ) # 输出: (N,24,126)
+
+        # 残差块
+        self.layer1 = ResBlock(24, 32, stride=2)  # 输出: (N,32,63)
+        self.layer2 = ResBlock(32, 48, stride=2)  # 输出: (N,48,32)
+
+        # 全局池化
+        self.global_pool = nn.AdaptiveAvgPool1d(1)
+        
+        # 特征提取器
+        self.feature_extractor = nn.Sequential(
+            nn.Linear(48, 64),
+            nn.ReLU(),
+            nn.Linear(64, 32)
+        )
+
+    def forward(self, x):   
+        '''
+        :param x: shape:(batch_size, 126, 40)
+        :return: features shape:(batch_size, 32)
+        '''
+        x = x.transpose(1, 2)  # (batch_size, 40, 126)
+        # 初始卷积
+        out = self.conv1(x)    # (N,24,126)
+        # 残差块
+        out = self.layer1(out) # (N,32,63)
+        out = self.layer2(out) # (N,48,32)
+        # 全局池化和特征提取
+        out = self.global_pool(out)        # (N,48,1)
+        features = self.feature_extractor(out.squeeze(-1)) # (N,32)
+        return features
 
 
 def count_parameters(model):
@@ -135,14 +210,16 @@ class PINN(nn.Module):
         self._save_args()
 
         self.solution_u = Solution_u().to(device)
-        self.dynamical_F = MLP(input_dim=35,output_dim=1,
+        self.dynamical_F = MLP(input_dim=33,output_dim=1,
                                layers_num=args.F_layers_num,
                                hidden_dim=args.F_hidden_dim,
                                droupout=0.2).to(device)
+        self.feature_extractor = CNN().to(device)
 
         # self.optimizer = torch.optim.Adam(self.parameters(), lr=args.warmup_lr)
         self.optimizer1 = torch.optim.Adam(self.solution_u.parameters(), lr=args.warmup_lr)
         self.optimizer2 = torch.optim.Adam(self.dynamical_F.parameters(), lr=args.lr_F)
+        self.optimizer3 = torch.optim.Adam(self.feature_extractor.parameters(), lr=args.lr_F)
 
         self.scheduler = LR_Scheduler(optimizer=self.optimizer1,
                                       warmup_epochs=args.warmup_epochs,
@@ -160,6 +237,7 @@ class PINN(nn.Module):
         # loss = loss1 + alpha*loss2 + beta*loss3
         self.alpha = self.args.alpha
         self.beta = self.args.beta
+        self.wandb = self.args.wandb
 
     def _save_args(self):
         if self.args.log_dir is not None:
@@ -177,11 +255,13 @@ class PINN(nn.Module):
         checkpoint = torch.load(model_path)
         self.solution_u.load_state_dict(checkpoint['solution_u'])
         self.dynamical_F.load_state_dict(checkpoint['dynamical_F'])
+        self.feature_extractor.load_state_dict(checkpoint['feature_extractor'])
+
         for param in self.solution_u.parameters():
             param.requires_grad = True
 
     def predict(self,xt):
-        return self.solution_u(xt)
+        return self.solution_u(xt).sum(dim=1)
 
     def Test(self,testloader):
         self.eval()
@@ -205,7 +285,7 @@ class PINN(nn.Module):
         with torch.no_grad():
             for iter,(x1,_,y1,_) in enumerate(validloader):
                 x1 = x1.to(device)
-                u1 = self.predict(x1)
+                u1 = self.predict(x1) 
                 true_label.append(y1)
                 pred_label.append(u1.cpu().detach().numpy())
         pred_label = np.concatenate(pred_label,axis=0)
@@ -214,24 +294,30 @@ class PINN(nn.Module):
         return mse.item()
 
     def forward(self,xt):
+        # dimxt = (batch_size, 126, 20)
         xt.requires_grad = True
-        x = xt[:,0:-1]
-        t = xt[:,-1:]
+        x = xt[:,:, 1:]  #(batch_size, 126, 19)
+        t = xt[:,:, 0].unsqueeze(2)  #(batch_size, 126, 1) 每个循环的充电时间
 
-        u = self.solution_u(torch.cat((x,t),dim=1))
+        charge_time = t.sum(dim=1) # (batch_size, 1) 所有循环的充电时间
 
-        u_t = grad(u.sum(),t,
+        u = self.solution_u(torch.cat((x,t),dim=2)) # (batch_size, 126, 20) -> (batch_size, 126, 1)
+        u = u.sum(dim=1) # (batch_size, 1)
+        u_t = grad(u.sum(), t,
                    create_graph=True,
                    only_inputs=True,
-                   allow_unused=True)[0]
+                   allow_unused=True)[0] # (batch_size, 126, 1)
         u_x = grad(u.sum(),x,
                    create_graph=True,
                    only_inputs=True,
-                   allow_unused=True)[0]
+                   allow_unused=True)[0] # (batch_size, 126, 19)
+        
+        xt_u_xt = torch.cat([xt, u_t, u_x], dim=2) # shape: (batch_size, 126, 40)
+        xt_u_xt_feat = self.feature_extractor(xt_u_xt)  # shape: (batch_size, 32)
 
-        F = self.dynamical_F(torch.cat([xt,u,u_x,u_t],dim=1))
+        F = self.dynamical_F(torch.cat([u,xt_u_xt_feat],dim=1)) # inputdim = 1+32=33
 
-        f = u_t - F
+        f = u/charge_time - F # 这个cycle的soh_loss/总充电时间 - F 要约等于0
         return u,f
 
     def train_one_epoch(self,epoch,dataloader):
@@ -246,6 +332,7 @@ class PINN(nn.Module):
 
             # data loss
             loss1 = 0.5*self.loss_func(u1,y1) + 0.5*self.loss_func(u2,y2)
+            # 用寿命衰减总和作比较
 
             # PDE loss
             f_target = torch.zeros_like(f1)
@@ -259,10 +346,11 @@ class PINN(nn.Module):
 
             self.optimizer1.zero_grad()
             self.optimizer2.zero_grad()
+            self.optimizer3.zero_grad()
             loss.backward()
             self.optimizer1.step()
             self.optimizer2.step()
-
+            self.optimizer3.step()
             loss1_meter.update(loss1.item())
             loss2_meter.update(loss2.item())
             loss3_meter.update(loss3.item())
@@ -283,24 +371,51 @@ class PINN(nn.Module):
             early_stop += 1
             loss1,loss2,loss3 = self.train_one_epoch(e,trainloader)
             current_lr = self.scheduler.step()
+            ################################## info ##############################################
             info = '[Train] epoch:{}, lr:{:.6f}, ' \
                    'total loss:{:.6f}'.format(e,current_lr,loss1+self.alpha*loss2+self.beta*loss3)
             self.logger.info(info)
+
+            if self.args.wandb:
+                wandb.log({
+                    "epoch": e,
+                    "learning_rate": current_lr,
+                    "train_total_loss": loss1 + self.alpha*loss2 + self.beta*loss3,
+                    "train_data_loss": loss1,
+                    "train_PDE_loss": loss2,
+                    "train_physics_loss": loss3,
+                })
+            
             if e % 1 == 0 and validloader is not None:
                 valid_mse = self.Valid(validloader)
                 info = '[Valid] epoch:{}, MSE: {}'.format(e,valid_mse)
                 self.logger.info(info)
+                if self.args.wandb:
+                    wandb.log({
+                        "epoch": e,
+                        "valid_mse": valid_mse
+                    })
+
             if valid_mse < min_valid_mse and testloader is not None:
                 min_valid_mse = valid_mse
                 true_label,pred_label = self.Test(testloader)
                 [MAE, MAPE, MSE, RMSE] = eval_metrix(pred_label, true_label)
                 info = '[Test] MSE: {:.8f}, MAE: {:.6f}, MAPE: {:.6f}, RMSE: {:.6f}'.format(MSE, MAE, MAPE, RMSE)
+                if self.args.wandb:
+                    wandb.log({
+                        "epoch": e,
+                        "test_mse": MSE,
+                        "test_mae": MAE,
+                        "test_mape": MAPE,
+                        "test_rmse": RMSE
+                    })
                 self.logger.info(info)
                 early_stop = 0
 
                 ############################### save ############################################
                 self.best_model = {'solution_u':self.solution_u.state_dict(),
-                                   'dynamical_F':self.dynamical_F.state_dict()}
+                                   'dynamical_F':self.dynamical_F.state_dict(),
+                                   'feature_extractor':self.feature_extractor.state_dict()}
                 if self.args.save_folder is not None:
                     np.save(os.path.join(self.args.save_folder, 'true_label.npy'), true_label)
                     np.save(os.path.join(self.args.save_folder, 'pred_label.npy'), pred_label)
